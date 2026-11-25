@@ -56,27 +56,40 @@ Connection passwords are encrypted with ASP.NET Data Protection and never return
 - Parameters and definitions: `sys.parameters`, `sys.sql_modules`.
 
 **Algorithm:**
-1. Load each catalog view once per object kind, not once per table (avoids N+1 queries).
-2. Build an in-memory model: `Table → Columns, PrimaryKey, ForeignKeys (outgoing), ReferencedBy (incoming)`.
-3. Store the model in a per-connection cache with a version stamp and a TTL (default 10 minutes). A "Refresh schema" action invalidates it.
+1. Load each catalog view once per object kind, not once per table (avoids N+1 queries). Five queries cover objects with definitions, columns, primary keys, foreign keys, and parameters.
+2. Build an in-memory model: `Table → Columns, PrimaryKey, ForeignKeys (outgoing), ReferencedBy (incoming)`. Routines carry their parameters and definition.
+3. Cache the model per connection with a TTL (default 10 minutes). The cache key includes the connection's `UpdatedAt` ticks, so editing a connection invalidates its cached schema without an explicit call. `?refresh=true` forces a reload.
 
-**Performance:** the model for a large database (thousands of tables) is kept as dictionaries keyed by object id, so lookups are O(1). Metadata is loaded lazily per object kind when the user first opens that section.
+**Deferred:** per-kind lazy loading. Everything loads in one pass in v1.
+
+**Concurrency:** two simultaneous first requests for the same connection may both load. This is accepted for v1 and is not locked.
 
 ## 5. Table Data View
 
+**Request and response (rows)**
+- `POST /api/connections/{id}/tables/{schema}/{table}/rows` with `{ startRow, endRow, sortModel: [{colId, sort}], filterModel: { colId: AG Grid filter }, quickFilter, includeCount }`.
+- Blocks are capped at 1,000 rows. Response: `{ rows: [...], lastRow }`. `lastRow` is the total count when `includeCount` is true, otherwise null.
+
 **Read path**
-- The grid uses AG Grid's server-side row model: the client requests blocks (for example 200 rows) by `startRow`, `endRow`, `sortModel`, `filterModel`.
-- API builds `SELECT ... ORDER BY <pk> OFFSET @skip ROWS FETCH NEXT @take ROWS ONLY`. If there is no PK, it orders by all columns and disables inline edits with a visible warning.
-- Total count uses a separate `COUNT_BIG(*)` with the same filter, executed only when the grid asks for it. For very large tables the count can be turned off in settings.
+- The grid uses AG Grid's server-side row model: the client requests blocks by `startRow`/`endRow`.
+- API builds `SELECT <cols> FROM [s].[t] <where> ORDER BY <sort>, <pk> OFFSET @skip ROWS FETCH NEXT @take ROWS ONLY`. Sort columns come before the PK so paging stays stable.
+- Without a PK and without a sort, ordering falls back to all orderable columns. If none exist, `ORDER BY (SELECT NULL)` is used. The response includes `hasPrimaryKey: false` so the UI can disable inline edits.
+- Total count uses `SELECT COUNT_BIG(*) FROM ... <where>` and runs only when `includeCount` is true.
 
 **Filter translation**
-- Each AG Grid filter model (text, number, date, set) is translated into a parameterized `WHERE` clause. Column names come only from the cached metadata (whitelist), never from user text. Values are always bound as parameters.
+- Each AG Grid filter model (text, number, date, set) becomes a parameterized predicate. Column names come only from the cached metadata (whitelist), never from user text. Values are always bound as parameters.
+- Text predicates compare `CAST([col] AS nvarchar(max))`, so they work on any column type. LIKE wildcards in user input are escaped.
+- `quickFilter` (Ctrl+F) is an OR of contains-predicates across all non-binary columns. A `columns` list can narrow it to the active column.
 
-**Write path**
-- Edits are batched per grid transaction: `{ inserts[], updates[], deletes[] }`.
-- Updates use the primary key in the `WHERE` clause. If the table has a `rowversion` column, it is also used as an optimistic concurrency check.
-- The whole batch runs in one SQL transaction. Any failure rolls back the batch and returns per-row errors.
-- Read-only connections reject all write paths before SQL is sent.
+**Write path (changes)**
+- `POST .../changes` with `{ inserts: [{values}], updates: [{keys, values, rowVersion}], deletes: [{keys, rowVersion}] }`.
+- Execution order inside one transaction: deletes, then updates, then inserts. Deletes run first so unique keys are freed before updates and inserts.
+- Updates and deletes must match exactly one row. If a table has a `rowversion` column and the client sends `rowVersion`, it is added to the `WHERE` clause as an optimistic check.
+- Inserts and updates use `OUTPUT inserted.*` so the grid receives generated identity values and the stored row.
+- Any failing statement rolls back the whole batch. The response is `409` with per-operation errors `{group, index, message}`.
+- Validation errors (unknown column, identity or computed column in values, missing PK keys) are `400` and no SQL is sent.
+- Views cannot be written (`400`). Read-only connections are rejected with `403` before SQL is sent.
+- Successful batches write one `AuditLog` row with the change counts.
 
 ## 6. Filter and Lookup UX
 
@@ -110,7 +123,7 @@ Connection passwords are encrypted with ASP.NET Data Protection and never return
 
 - Monaco editor with T-SQL language mode and keyword completion from the cached metadata (table and column names).
 - Execution: `SqlCommand` with a timeout from the connection settings. Multiple result sets are supported and returned as pages. Display row cap defaults to 10,000.
-- Read-only connections, or a "read-only mode" toggle, block statements that are not SELECT. Check with a T-SQL parser step; if the parser is unavailable, fall back to a conservative allow-list of leading keywords. This guards against accidental writes; it is not a security boundary.
+- Read-only connections block statements that are not SELECT. The implemented guard (`ReadOnlyGuard`) is a tokenizer, not a T-SQL parser. Every statement must start with SELECT, WITH, or DECLARE, and no write, DDL, or EXEC keyword may appear outside comments, strings, and quoted identifiers. This guards against accidental writes; it is not a security boundary.
 - Saved queries: CRUD per user, optionally scoped to a connection, organized in folders.
 
 ## 10. API Surface (v1)
@@ -146,6 +159,9 @@ All responses are JSON. Errors use RFC 7807 problem details.
 - Relation graph, depth 3, 500 rows per edge: under 2 s.
 - Grid scrolling stays smooth through AG Grid row virtualization; no full table is loaded into the browser.
 
+Measured on the local SQL Server 2022 container with 50,000 rows (`PERF` probe, not kept in the repo):
+- Schema load (one table): 250 ms. First 200-row page with count: 56 ms. Filtered page: 51 ms. Page at offset 40,000: 12 ms.
+
 ## 13. Project Layout (current)
 
 ```
@@ -157,10 +173,12 @@ dbexplorer/
   src/DbExplorer.Application/    (domain entities, contracts, service interfaces)
   src/DbExplorer.Infrastructure/ (EF Core SQLite app DB, Identity, connection service, SQL Server tester)
   tests/DbExplorer.Api.Tests/    (xUnit integration tests via WebApplicationFactory)
-  web/                           (React + Vite + TypeScript SPA, planned for Phase 1b)
+  web/                           (React + Vite + TypeScript SPA: AG Grid, Monaco, relations, saved queries)
 ```
 
 ## 14. Delivery Phases
+
+Status: all seven phases and the SPA are implemented. Progress and test results are in `docs/progress/`.
 
 1. Backend skeleton, auth, connection CRUD, connection test.
 2. Schema download and cache.

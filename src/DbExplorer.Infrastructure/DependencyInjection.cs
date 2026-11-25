@@ -32,6 +32,14 @@ public static class DependencyInjection
         services.AddSingleton<ISecretProtector, DataProtectionSecretProtector>();
         services.AddScoped<IConnectionService, Persistence.ConnectionService>();
         services.AddSingleton<ISqlServerConnectionTester, SqlServerConnectionTester>();
+        services.AddMemoryCache();
+        services.Configure<Metadata.SchemaCacheOptions>(configuration.GetSection(Metadata.SchemaCacheOptions.SectionName));
+        services.AddSingleton<ISchemaLoader, Metadata.SqlServerSchemaLoader>();
+        services.AddScoped<ISchemaService, Metadata.SchemaService>();
+        services.AddScoped<ITableDataService, Data.TableDataService>();
+        services.AddScoped<IRelationService, Relations.RelationService>();
+        services.AddScoped<IQueryService, Queries.QueryService>();
+        services.AddScoped<ISavedQueryService, Queries.SavedQueryService>();
 
         return services;
     }
