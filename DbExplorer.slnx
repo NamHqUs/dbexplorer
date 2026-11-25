@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DbExplorer.Api/DbExplorer.Api.csproj" />
+    <Project Path="src/DbExplorer.Application/DbExplorer.Application.csproj" />
+    <Project Path="src/DbExplorer.Infrastructure/DbExplorer.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/DbExplorer.Api.Tests/DbExplorer.Api.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,16 @@
+# Build output
+bin/
+obj/
+*.user
+.vs/
+.vscode/
+
+# Local app database and secrets
+*.db
+*.db-shm
+*.db-wal
+appsettings.*.local.json
+
+# Frontend
+web/node_modules/
+web/dist/
